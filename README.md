@@ -1,0 +1,192 @@
+# DeepLearning Accelerator Virtual Machine
+
+本项目参照TVM，重新设计编译流程，以加速器为主要的后端Target进行构建，最终预想为以ONNX模型为输入（或其他级别IR）以不同深度学习加速器为输出（Target）的端到端深度学习编译系统。
+
+项目文件结构：
+
+    adr: 编译器基础的数据结构的定义以及算子注册相关，包含算子schedule和make函数
+    
+    backend: 编译器的后端部分，基于driver.IR实现，主要包括算子编译以及代码生成部分，对应多种编译逻辑，包括Regs和Aux
+
+    clib: 在常规处理中需要用到的C语言库的接口，也包含部分数据处理函数
+    
+    codegen: 编译器的后端部分，后续不再维护，以直接代码生成方式进行后端实现，方式较为死板且固定
+    
+    device: 添加不同后端加速器的配置设定，能够进行device的选择，对应加速器的宏定义
+    
+    driver: 算子compute相关，即tasks函数，算子对应的寄存器配置生成，除此之外包含底层ir的实现，以中间代码实现tasks
+    
+    frontend: 编译器的前端部分，当前只包含对ONNX框架的支持，后续添加对其他框架或IR（如TVM）的支持
+
+    llm: 已经release的大模型计算图代码，以adr.ir实现，直接可接入
+    
+    ne: Number Expression数字表达式，为编译器提供动态控制的核心
+
+    runtime: 考虑作为编译后模型运行的组件，目前未开发完成
+
+    target: 对应backend和driver.IR，为其实际的代码生成模块，对每一个表达式(Expression/Expr)和语句(Statement/Stmt)进行了代码实现
+    
+    transform: 编译阶段计算图转换部分，通常涉及计算图形状推理、优化或者权重离线处理等
+
+    utils: 一些简单的组件，如log、cout等
+
+
++ 本文以开发者视角，主要描述如何使用和开发此项目
+
+## 使用编译器进行模型编译
+
++ 此项目可以参考script/main.py做具体参考
+
+对于一个模型的部署，实际需要的为三个内容/文件：权重、算子和计算图(计算流程)。考虑此项目由于开发时没有权重处理的需求，所以仅预留了权重预处理相关的位置但实际不做处理；计算图需由模型提供，所以需要作为编译器的输入；而算子已经在编译器中注册完成，可以直接调用。所以，需要用编译器中提供的封装好的算子去将计算图表示出来（此过程目前需要手动编写，后续提供直接模型加载方法，如onnx），实际操作与tensorflow类似：
+
+1. 模型计算图的编写和定义
+
+```python
+from dlavm import ne
+from dlavm import adr
+
+token = ne.Var("token", max_data=2048) # 动态维度定义，2048指此值最大为2048，以方便空间地址计算
+a = adr.hbm.var_ddr(name="a", shape=(1, token, 4096)) # 定义一个ddr的变量，也即input，名字为a，形状为(1, token, 4096)
+b = adr.hbm.const_hbm(name="b", data="hbm_weight.bin", shape=(4096, 256)) # 定义一个hbm类型的权重，名字叫b，shape方向为(CHin, CHout)
+c = adr.hbm.mvm(a, b) # 定义一个矩阵乘法运算，结果为c
+```
+
+以上，完成了一个MVM算子的定义。实际有哪些算子可用，可以参考dlavm.llm的定义方式进行学习，或直接找到dlavm/adr/op/hbm.py中参考并调用。需要强调的是，由于多个版本的兼容问题，有些算子实际上已经放弃维护，需要注意。在编写过程中，可以随时打印对应的中间结果（如上的c）进行显示:
+
+```shell
+def main(a) {
+  a = var()
+  b = constant()
+  %0 = accel.hbm.mvm(a, b)
+  return %0
+}
+```
+
++ 注意，如果算子层数过多，那么会出现python的error，大体情况为递归超过上限，则需要在代码前加入以下设置：
+
+```python
+import sys
+sys.setrecursionlimit(3000) # 默认为1000，也可根据电脑和模型情况设置更高
+```
+
+2. 计算图优化和处理
+
+计算图编写完成后，需要做验证和(形状)推理，既判断此计算图编写是否合理，是否能继续后续的编译，如类型是否合规(MVM的第二个参数需要为HBM，int4类型)，形状是否合规(矩阵乘法：(1, token, chin_0)x(chin_1, chout)，需判断chin_0是否与chin_1相等)。如果检查通过，则会进行此节点的形状推理，推理出此节点的输出维度：
+
+```python
+from dlavm import device
+from dlavm import transform
+
+last_token = ne.Var("last_token", max_data=2048) # 定义last_token，统一加载到所有计算图的节点中
+# 第一个参数为上述定义好的计算图，第二个参数为此编译需要的硬件加速器配置，也即宏定义，第三个参数为全局属性，会加载到所有算子节点上去
+c = transform.infer_type(c, device.hbm_accel.HBM0923, attrs={"last_token": last_token}) # c为通过优化后的计算图
+```
+
+c计算图依然可以打印进行展示，如下，此时可以发现，每个节点的内容均已打印出来，ret为return，即为当前节点的尺寸
+
+```shell
+def main(a) {
+  a = var() /* ret=(1, token, 4096), dtype=(float16, ddr), device=hbm */
+  b = constant() /* ret=(4096, 256), dtype=(int4, hbm), device=hbm */
+  %0 = accel.hbm.mvm(a, b) /* ret=(1, token, 256), dtype=(float16, ddr), device=hbm */
+  return %0
+}
+```
+
++ 以上infer_type是必须的优化，由于手动编写计算图考虑已经为最优情况，所以其他优化方法如算子融合、死算子消除等已经没有使用的必要，完善好onnx等前端后可以考虑使用。数据离线处理实用性较强，可在此阶段完善。
+
+3. 优化设置与编译
+
+接下来需要对编译进行设置，主要包括地址相关、内存相关、代码生成相关等。
+
+- 内存块前缀与基地址设置
+
+  内存块必须包括："global", "weight", "runtime", "insts", "hbm", "hbm_cache"，可能需包括："cache", "onchip"
+  
+  runtime, onchip类型，均具有pingpong性质，会根据使用的情况，自动覆盖数据，如果需要新添加类似的内存块，考虑在dlavm/backend/plan_memory.py中找到pingpong=[]，添加新的内存前缀即可。其余内存块均无pingpong属性，其主要包括权重数据、指令数据，cache数据等。
+
+  内存块整体的排布通过python的dict实现：如{"global": 0x0, "weight": "global", "hbm": 0x0, "hbm_cache": "hbm"}，此内存块的排布方案为：global的基地址为0x0，weight的地址排布在global后，hbm在新的0x0地址上，hbm_cache排布在hbm后，也即key值为内存块，value值为key值对应的地址情况（新的基地址或上一个内存块的名字）
+
+- 编译相关设置
+
+  以下介绍主要的设置信息，其信息均需用dict字典保存：
+
+    wt2hbm: Bool值，默认为False，是否开启wt2hbm权重加载，否则为pcie2hbm
+
+    debug: Bool值，默认为True，实际为log记录算子的地址转移情况
+
+    ddr_base/hbm_base: Int值，为ddr和hbm的基地址信息，VCU128为0x2_0000_0000/0x0
+
+    align: Int值，默认为0x10，为内存对齐情况，即在每次malloc时的最小内存单元
+
+    lite: Bool值，默认为False，如果开启，则会强制将for循环去掉，避免由于for循环对kvcache的负优化
+
+    namespace: Bool值，默认为False，如果开启，会对target为C++的h文件生成具有namespace的代码，以同时使用多个模型进行加载
+
+- 其余设置
+
+  其余主要包括name，函数/模型名，编译模式(Regs模式和Aux模式)，以及代码生成对象
+
+实际代码编写如下：
+
+```python
+from dlavm import backend
+from dlavm.target import targets
+
+target = targets.hpp # 目前仅支持hpp
+init_addr = {"global": 0x0, "weight": "global", "runtime": "weight", "insts": "runtime", "hbm": 0x0, "hbm_cache": "hbm"}
+build_config = {"wt2hbm": True, "debug": True, "ddr_base": 0x20000_0000, "hbm_base": 0x0, "align": 0x4000}
+# 参数分别为：计算图，地址块，模型名，是否aux，代码target生成，编译设置
+mod = backend.build(c, init_addr, "model_mvm", True, target, build_config) # 实际编译
+```
+
+4. 编译目标生成与保存
+
+上述生成的mod即为最终的编译目标，根据需要可以进行进一步的工作，主要包括：代码生成、指令生成(aux模式)等，后续考虑更新直接运行、可视化算子计算图等等。
+
+以当前功能为例：
+
+```python
+source = mod.get_source()
+insts = mod.get_insts_bin()
+
+with open("src.inc.h", "w") as f:
+    f.write(source)
+
+with open("inst.bin", "wb") as f:
+    f.write(insts)
+```
+
+5. 编译生成的头文件简介
+
+首先，需注意，此项目生成的.h头文件并非常规的头文件，此文件更类似于”一次性“的.inc类型头文件，内容为C++代码片段，但是以头文件形式引用，由于声明和定义包含在一起，所以只能被加载一次。
+
+此文件整体结构内容如下：
+
+```cpp
+// generated by dlavm.backend in 2024-10-26 19:47:13
+
+// runtime storage define
+uint64_t runtime0 = 0x000000000;
+...
+// hbm storage define
+uint64_t hbm0 = 0x000000000;
+
+uint64_t a = (runtime0 + 8589934592);
+
+uint64_t output = (runtime1 + 8589934592);
+
+...
+
+void model_mvm_load_params(HANDLE& device, HANDLE& h2cx, char* prefix) {
+  b_load_param(device, h2cx, prefix);
+}
+
+...
+
+void model_mvm(HANDLE& device) {
+  aux_block_1(device);
+}
+```
+
+其中，runtime0、hbm0等即为内存块，a、output为输入、输出的实际地址（或输出函数封装），而xxxx_load_params和xxxx即为封装好的权重加载和模型运行函数。
