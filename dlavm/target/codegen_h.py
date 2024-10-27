@@ -16,7 +16,7 @@ class CodeGenH(CodeGenBase):
         super().__init__()
 
     def main(self, stmt: ir.Function):
-        stmt = transform.InferArgs().Visit(stmt)
+        stmt = transform.InferArgs(handle=True).Visit(stmt)
         self._memo_lib = []
         source = self.Visit(stmt)
         return source

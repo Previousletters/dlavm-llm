@@ -7,7 +7,7 @@
     adr: 编译器基础的数据结构的定义以及算子注册相关，包含算子schedule和make函数
     
     backend: 编译器的后端部分，基于driver.IR实现，主要包括算子编译以及代码生成部分，对应多种编译逻辑，包括Regs和Aux
-
+    
     clib: 在常规处理中需要用到的C语言库的接口，也包含部分数据处理函数
     
     codegen: 编译器的后端部分，后续不再维护，以直接代码生成方式进行后端实现，方式较为死板且固定
@@ -17,17 +17,17 @@
     driver: 算子compute相关，即tasks函数，算子对应的寄存器配置生成，除此之外包含底层ir的实现，以中间代码实现tasks
     
     frontend: 编译器的前端部分，当前只包含对ONNX框架的支持，后续添加对其他框架或IR（如TVM）的支持
-
+    
     llm: 已经release的大模型计算图代码，以adr.ir实现，直接可接入
     
     ne: Number Expression数字表达式，为编译器提供动态控制的核心
-
+    
     runtime: 考虑作为编译后模型运行的组件，目前未开发完成
-
+    
     target: 对应backend和driver.IR，为其实际的代码生成模块，对每一个表达式(Expression/Expr)和语句(Statement/Stmt)进行了代码实现
     
     transform: 编译阶段计算图转换部分，通常涉及计算图形状推理、优化或者权重离线处理等
-
+    
     utils: 一些简单的组件，如log、cout等
 
 
@@ -190,3 +190,227 @@ void model_mvm(HANDLE& device) {
 ```
 
 其中，runtime0、hbm0等即为内存块，a、output为输入、输出的实际地址（或输出函数封装），而xxxx_load_params和xxxx即为封装好的权重加载和模型运行函数。
+
+
+## 编译器开发细节指南
+
+由于编译器比较庞大，所以修改起来并非易事，以下展示了一些特定方向的更新维护和开发。
+
+首先需要介绍整体编译器的结构和开发原理，编译器中定义了两层的IR（中间代码），第一层以对接模型前端，称其为adr.ir，如ONNX、TVM等框架，进行模型转换，将现有的框架算子读入编译器中并以此编译器给定的算子（或称其为IR）进行统一；第二层IR实现了每个算子的计算（对于加速器来说实际上为寄存器指令的生成），称其为driver.ir，这样可以更方便扩展后端代码的生成；具体情况如下：
+
+<img src="images/dlavm.drawio.png" alt="img" style="zoom: 33%;" />
+
+### 新算子注册/更新
+
+编译器采用算子注册机制（仿照TVM），如果需要新的算子时需先注册，才能使用。如上图，算子库中主要将算子的调度和计算进行了分开，算子调度可以认为是算子串联情况，如形状推理、类型推理等，计算在此处主要指寄存器指令的生成。接下来，以MVM算子为例，对算子的注册过程进行描述：
+
+1. 注册算子，实现算子调度
+
+MVM算子的注册，我们假设它属于hbm算子库中。根据上图，我们主要需要在adr.ir中提供此算子以及其调度方法：在adr/op文件夹下新建_hbm.py和hbm.py两个文件（已建立），并添加进对应的__init__.py中。
+
+首先应在_hbm.py中对算子的调度/推理进行定义和注册，其中，MVMRel的参数是固定的，args为此算子的输入，attrs为此算子的属性。定义完成调度/推理函数MVMRel过后，将此函数指针与算子名一起进行注册，直接调用Op.Register即可
+
+```python
+# _hbm.py
+from ..base import Op, Tensor, Tuple, DataEnum, DataType
+
+def MVMRel(args, attrs):
+    if len(args) != attrs["skip"]+1:
+        return False, "skip should be 1"
+    device = args[0].device
+    dshape, dtype = args[0].shape, args[0].dtype  # H, W, C
+    wshape, wtype = args[1].shape, args[1].dtype  # Cin, Cout
+    if dtype.mapped != DataEnum.ddr or dtype.dtype != DataEnum.fp16:
+        return False, "data type error, should be ddr with fp16"
+    if wtype.mapped != DataEnum.hbm or wtype.dtype != DataEnum.int4:
+        return False, "weight type error, should be ddr with int4"
+    if dshape[-1] != wshape[0]:
+        return False, "weight shape should be [in_channels, out_channels]"
+    if len(args) > 2:
+        for n in range(len(args)-2):
+            if args[1] != args[2+n]:
+                return False, "not support"
+    if attrs.get("arg_max", 0):
+        return False, "arg max not support now"
+    oshape = [i for i in dshape]
+    oshape[-1] = wshape[-1]
+    return True, Tensor(oshape, dtype, device)
+
+Op.Register("accel.hbm.mvm", MVMRel)
+```
+
+由此，算子库中已存在此名为"accel.hbm.mvm"算子，调度方式为MVMRel函数。
+
+2. 封装算子的调用
+
+虽然我们已注册成功名为"accel.hbm.mvm"算子，但是我们并未提供一种对于使用者来说较为简单的算子调用方法。此方法我们考虑将其定义在hbm.py文件中，具体如下：
+
+```python
+from ..base import Op, Call, Var, Constant, DataEnum, DataType
+
+def mvm(data, weight, skip=1, **kwattrs):
+    attrs = {
+        "skip": skip,
+        **kwattrs
+    }
+    return Call(Op.Get("accel.hbm.mvm"), [data, weight], attrs)
+```
+
+此函数的参数很灵活，根据需要自行调整，将需要作为算子属性的参数添加入函数输入即可，如Conv2D的strides和padding，即可添加进attrs中。其次，return Call(op, args, attrs)函数较为固定，data、weight为此算子的输入，也即args，由list记录，返回算子调用节点（adr.ir Call节点）。
+
++ 对与Var（Input）和Constant（Weight）节点，请参考dlavm/adr/op/hbm.py的var_ddr，const_ddr，const_hbm等函数
+
+3. 算子测试（选）
+
+算子注册完成后可参照 __编译器的使用方法__ 中提到的编写计算图的过程，对算子的注册和调度情况进行测试。其中使用此算子的方式即为调用2中定义的函数。
+
+4. 算子计算的注册/硬件tasks的更新
+
+定义完算子的调度方法后，需要完成对算子的计算方法的定义和注册。通常这部分代码会存储在dlavm/driver中，上述注册的算子名为"accel.hbm.mvm"，为了更好的区分每个算子所属的类别，那么此算子的计算/tasks函数可以保存在hbm_ir中。需注意，此处的ir与上述的ir逻辑不同，此处的ir指的是driver.ir，是为了定义算子的计算方法，更符合C/C++的中间代码（既存在表达式expr又存在语句stmt）；而上述的ir指的是adr.ir，更符合深度学习的中间代码（仅包含表达式而无语句）。
+
+以下依然以"accel.hbm.mvm"为例，简述算子计算的注册。首先，在dlavm/driver/hbm_ir中新建__init__.py，\_hbm_compute.py和tasks.py，其中__init__.py主要为加载注册函数，防止在调用算子前没有加载注册好的内容，具体可以参考dlavm/driver/hbm_ir/\_\_init\_\_.py的内容；tasks.py为硬件testbench翻译而来的最小化的驱动函数；\_hbm_compute.py即为__init__.py需要加载的注册对象，并连接编译器与tasks.py的内容：
+
+```python
+# tasks.py
+import math
+import numpy as np
+from dlavm import ne
+from ...clib import FP32_to_FP20
+from ...device import hbm_accel
+from ..basic import Tasks
+from .. import ir
+from ..ir import CSB_Write, CSB_Read, While
+
+@Tasks.Register("atom.hbm.mvm", hbm_accel.HBM0912)
+def MVMBasic(block, args, outputs, device, onchip={}, kvcache=0, EW_MODE=0, **attrs):
+    dshape = args[0].shape
+    daddrs = args[0].get_address()
+    ...
+    block += CSB_Write(2,0)
+    ...
+    block += CSB_Write(33,mode)
+    block += While(CSB_Read(1) != 1)
+```
+
+如果硬件驱动需要更新，建议新建一个device版本，并进行参数更新，如现在dlavm/device/hbm_accel.py中创建新的device：
+
+```python
+# dlavm/device/hbm_accel.py
+class HBM0923(HBM0912):
+    version = 20240923
+
+# dlavm/driver/hbm_ir/tasks.py
+@Tasks.Register("atom.hbm.mvm", hbm_accel.HBM0923)
+def NewMVMBasic(...):
+```
+
+需要强调的是，@Tasks.Register为注册方法，第一个参数为tasks注册的名字，第二个参数为加速器的设备版本，以方便多版本管理和同步。在调用时会自动找到对应的tasks最新的实现方法。其次，需要解释MVMBasic函数的一些参数含义：通常来说，此函数的参数无需完全固定，但是block(driver.ir，用于记录需要进行代码生成的操作)、args(输入的list，每个元素都具有shape、get_address()属性)、outputs以及device等参数较为关键，需要谨慎考虑；为了更容易扩展，建议保留**attrs的位置。
+
+此处，我们注册的一个tasks，参考名字，此tasks为原子操作，即不含有for循环/多次计算等操作，实际的计算拆分需要通过driver.ir实现并使用for循环（driver.ir中定义的）去连续调用tasks来实现。以下为简单的描述，具体可参考dlavm/driver/hbm_ir/_hbm_compute.py
+
+```python
+def MVM(args, outputs, **attrs):
+    device = args[0].device
+    Hin, Win = 1, args[0].shape[-2]
+    CHin, CHout = args[1].shape
+    PixelBytes, Tin = device.Pixel_Data_Bytes, device.base_Tin
+    DAT_BRAM_DEPTH = device.DAT_BRAM_DEPTH
+    strides = [Hin*Win*PixelBytes, Win*PixelBytes, PixelBytes]
+    if hasattr(args[0], "strides"):
+        strides = args[0].strides
+    WT_CHin_div_Tin = Ceil(CHin, Tin)
+    if DAT_BRAM_DEPTH < WT_CHin_div_Tin:
+        raise RuntimeError("Could not split now for MVM")
+    w_slice = DAT_BRAM_DEPTH // WT_CHin_div_Tin
+    with ir.Function(get_vars([args[0].shape, attrs])) as func:
+        out_w_slice            = w_slice
+        min_dat_depth          = Win*WT_CHin_div_Tin
+        Wout_Split_Times_minus1= (min_dat_depth+(out_w_slice*WT_CHin_div_Tin)-1)//(out_w_slice*WT_CHin_div_Tin) -1
+        Wout_Split_Times_minus1= func.assign("wout_split_times_minus1", Wout_Split_Times_minus1, "int")
+        Wout_Split_Times       = Wout_Split_Times_minus1 + 1
+        out_w_slice_last       = (min_dat_depth-(Wout_Split_Times_minus1)*out_w_slice*WT_CHin_div_Tin)//WT_CHin_div_Tin
+        out_w_slice_last       = func.assign("out_w_slice_last", out_w_slice_last, "int")
+        with ir.For("out_w", 0, Wout_Split_Times) as w:
+            w_slice = ne.If(w.var < Wout_Split_Times_minus1, out_w_slice, out_w_slice_last)
+            dshape = replace(args[0].shape, -2, w_slice)
+            data = args[0].gen_tensor(shape=dshape, offset=w.var*out_w_slice*PixelBytes+args[0].offset)
+            setattr(data, "strides", strides)
+            oshape = replace(outputs[0].shape, -2, w_slice)
+            output = Tensor(oshape, outputs[0].dtype, device)
+            output = outputs[0].gen_tensor(shape=oshape, offset=w.var*out_w_slice*PixelBytes+outputs[0].offset)
+            setattr(output, "strides", strides)
+            Tasks.Get("atom.hbm.mvm", device)(w, replace(args, 0, data), replace(outputs, 0, output), device, **attrs)
+        func += w
+    return func
+
+Op.Get("accel.hbm.mvm").attrs["compute"] = MVM
+```
+
+上述中的ir.Function为必须，意为创建一个函数的ir，其本身就可作为上述驱动tasks的block进行输入，或者类似此驱动，将ir.For作为Block进行输入，实际将tasks嵌入了funtion和for循环中。此处的实现描述较少，建议多仿照dlavm/driver/hbm_ir/_hbm_compute.py中的内容进行编写和补充。
+
+5. AUX模式中参数定义（选）
+
+为了支持AUX，需要每个算子提供AUX相关的设置内容。此内容实际较为简单，主要为instruction和位宽倍数：
+
+```python
+Op.Get("accel.hbm.mvm").attrs["cfg_id"] = [0b00001000, 2] # 2*AXI_DAT_WIDTH
+```
+
+以此，算子注册任务完成。
+
+### 新Target代码生成后端的注册
+
+为了支持更多的运行平台和目标，需要支持更多的编译后端，如VCU128的FPGA为Windows平台，而V80却为Linux平台，并且其某些驱动和函数的API存在不同。所以，我们将target编译目标作为后端，通过对上述driver.ir进行指定target的解析，即可完成代码的生成任务。目前代码的生成主要支持的是hpp，即C++的头文件。接下来将以此为基础做一些简单的修改和描述。
+
+1. 新建target目标
+
+为了标准化，我们考虑不将target作为字符串输入。所有的target对象保存在dlavm/target中。首先，新建字符串为target对象在targets.py中：
+
+```python
+v80 = "v80"
+```
+
+2. 新建对应的CodeGen方法
+
+在dlavm/target中新建codegen_v80.py文件。为了简单起见，我们考虑v80的驱动代码和hpp的驱动代码相差不多，主要是没有了HANDLE相关内容。
+
+```python
+from dlavm.driver import ir, transform
+from . import targets
+from .codegen_base import CodeGenEngine
+from .codegen_h import CodeGenH
+
+
+@CodeGenEngine.Register(targets.v80)
+class CodeGenV80(CodeGenH):
+
+    def main(self, stmt: ir.Function):
+        stmt = transform.InferArgs(handle=False).Visit(stmt)
+        self._memo_lib = []
+        source = self.Visit(stmt)
+        return source
+
+    def VisitCSBWrite(self, stmt: ir.CSB_Write):
+        tabs = self.tab * self.tab_num
+        addr = self.Visit(stmt.addr)
+        data = self.Visit(stmt.data)
+        return tabs + f"CSB_Write({addr}, {data});"
+
+    def VisitCSBRead(self, expr: ir.CSB_Read):
+        addr = self.Visit(expr.addr)
+        return f"CSB_Read({addr})"
+
+    ...
+```
+
+由于整体平台的API相差不大，所以直接继承CodeGenH来进行改写。main函数为整个代码生成的入口，所以必须有。其次，transform.InferArgs为优化方法，主要优化了ir的函数传入的参数，去除无用参数，并且如果需要添加HANDLE的话直接添加进ir的函数参数中。
+
+其次，对于特殊的节点，进行了改写，如CSB_Write节点，去除device的生成，CSB_Read节点同理。具体都有哪些节点可以改写，可以参考dlavm/target/codegen_h.py。
+
+至此，此代码生成后端V80即可调用。使用方法为:
+
+```python
+from dlavm.target import targets
+
+target = targets.v80
+```

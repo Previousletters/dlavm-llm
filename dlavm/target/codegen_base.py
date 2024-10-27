@@ -61,6 +61,7 @@ class CodeGenEngine:
     def Register(cls, target):
         def _register_task(codegen):
             cls.memo[target] = codegen
+            return codegen
         return _register_task
 
     @classmethod
